@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+
+# Flask instance folder (used for configs, secrets)
+instance/
+
+# Log files
+*.log
+logs/
+
+# State or persistent data for Raft
+raft_data/
+state/
+
+# Environment config
+.env
+
+# IDE settings
+.vscode/
+.idea/

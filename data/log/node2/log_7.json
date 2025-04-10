@@ -1,0 +1,1 @@
+{"term": 3, "command": {"type": "create_print_job", "payload": {"id": 1, "printer_id": "1", "filament_id": "1", "filepath": "models/cube.gcode", "print_weight_in_grams": 100}}, "index": 7}

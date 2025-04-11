@@ -1,1 +1,0 @@
-{"term": 1, "command": {"type": "create_printer", "payload": {"id": 1, "company": "Creality", "model": "this is new one"}}, "index": 2}

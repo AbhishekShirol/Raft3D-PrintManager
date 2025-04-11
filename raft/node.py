@@ -472,7 +472,6 @@
 #         """Return the current state of the state machine."""
 #         with self.lock:
 #             return self.state_machine.get_state()
-
 import json
 import logging
 import os
@@ -703,12 +702,10 @@ class RaftNode:
     def _send_heartbeats(self):
         """Send empty AppendEntries (heartbeats) to all followers."""
         for node in self.cluster_nodes:
-            # _send_append_entries now returns a response; we log it
-            response = self._send_append_entries(node)
-            # logger.info(f"AppendEntries response from {node}: {response}")
+            threading.Thread(target=self._send_append_entries, args=(node,)).start()
 
     def _send_append_entries(self, node):
-        """Send AppendEntries RPC to a specific follower and return the response."""
+        """Send AppendEntries RPC to a specific follower and log its actions."""
         with self.lock:
             next_idx = self.next_index.get(node, 1)
             prev_log_index = next_idx - 1
@@ -727,13 +724,14 @@ class RaftNode:
                 'entries': entries_dict,
                 'leader_commit': self.commit_index
             }
+        # Log what the follower is receiving (if any)
         # logger.info(f"Node {node} (follower) should receive AppendEntries with {len(entries_dict)} entries")
         try:
             response = self._send_rpc(node, 'append_entries', request)
             with self.lock:
                 if response.get('term', 0) > self.current_term:
                     self._update_term(response['term'], reason="higher term in RPC response", source_node=node)
-                    return response
+                    return
                 if response.get('success', False):
                     if entries:
                         self.next_index[node] = entries[-1].index + 1
@@ -742,13 +740,11 @@ class RaftNode:
                 else:
                     if self.next_index[node] > 1:
                         self.next_index[node] -= 1
-            return response
         except Exception as e:
             logger.warning(f"Failed to send AppendEntries to {node}: {e}")
-            return {}
 
     def _update_commit_index(self):
-        """Update commit_index based on majority match_index and commit new entries."""
+        """Update commit_index based on majority match_index and log the committed entry."""
         with self.lock:
             if self.state != NodeState.LEADER:
                 return
@@ -761,6 +757,7 @@ class RaftNode:
                 if entry and entry.term == self.current_term:
                     self.commit_index = majority_commit
                     logger.info(f"Leader {self.id} updated commit_index to {self.commit_index}")
+                    # Call commit_log_entries to log the commit and apply the command
                     self.commit_log_entries()
 
     def commit_log_entries(self):
@@ -775,7 +772,8 @@ class RaftNode:
                     logger.debug(f"Applied entry {self.last_applied}: {result}")
 
     def _apply_committed_entries(self):
-        """Continuously apply committed log entries to the state machine."""
+        """Apply committed log entries to the state machine (if not already applied)."""
+        # This function can be used if you want continuous background application.
         with self.lock:
             while self.last_applied < self.commit_index:
                 self.last_applied += 1
@@ -786,10 +784,7 @@ class RaftNode:
 
     def _handle_rpc(self, client_socket):
         """Handle an incoming RPC request."""
-        try:
-            logger.debug(f"Received RPC connection from {client_socket.getpeername()}")
-        except Exception:
-            logger.debug("Received RPC connection")
+        logger.debug(f"Received RPC connection from {client_socket.getpeername()}")
         try:
             data = b""
             while True:
@@ -934,15 +929,17 @@ class RaftNode:
         with self.lock:
             if self.state != NodeState.LEADER:
                 return {'success': False, 'error': 'Not leader', 'leader': self._get_leader_address()}
+            # Append command to leader's log
             entry = LogEntry(self.current_term, command)
             entry.index = self.log_storage.append_entry(entry)
             logger.info(f"Leader {self.id} proposing command: {command}")
             logger.info(f"Command appended successfully to leader {self.id}. Current log length: {self.log_storage.get_last_log_index()}")
-            # Send AppendEntries RPC to all followers and log their responses
+            # Optionally, send AppendEntries RPCs to all followers immediately
             for node in self.cluster_nodes:
                 logger.info(f"Sending AppendEntries RPC to {node}")
                 response = self._send_append_entries(node)
-                # logger.info(f"AppendEntries response from {node}: {response}")
+                logger.info(f"AppendEntries response from {node}: {response}")
+            # Wait for command to be committed
             start_time = time.time()
             timeout = 5.0  # seconds
             while time.time() - start_time < timeout:

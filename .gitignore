@@ -12,6 +12,7 @@ instance/
 # Log files
 *.log
 logs/
+data
 
 # State or persistent data for Raft
 raft_data/

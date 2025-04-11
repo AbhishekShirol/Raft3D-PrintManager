@@ -1,1 +1,0 @@
-{"term": 1, "command": {"type": "create_filament", "payload": {"id": 3, "type": "PLA", "color": "Blue", "total_weight_in_grams": 1000, "remaining_weight_in_grams": 1000}}, "index": 21}

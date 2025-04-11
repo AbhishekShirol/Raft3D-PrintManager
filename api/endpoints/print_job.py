@@ -47,10 +47,18 @@ def register_print_job_endpoints(app, raft_node):
                 
                 return jsonify({'error': 'Print job created but not found in state'}), 500
             else:
+                # error = result.get('error', 'Unknown error')
+                # if error == 'Not leader':
+                #     return jsonify({'error': 'Not the leader node', 'leader': result.get('leader')}), 307
+                # return jsonify({'error': error}), 500
                 error = result.get('error', 'Unknown error')
                 if error == 'Not leader':
                     return jsonify({'error': 'Not the leader node', 'leader': result.get('leader')}), 307
-                return jsonify({'error': error}), 500
+                elif 'Invalid status transition' in error:
+                    return jsonify({'error': error}), 400  # Bad request for logical validation errors
+                else:
+                    return jsonify({'error': error}), 500
+
         
         except Exception as e:
             logger.error(f"Error creating print job: {e}")

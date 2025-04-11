@@ -75,6 +75,10 @@
 #         self.server_socket.bind(('0.0.0.0', port))
 #         self.running = False
         
+#         # Leader information tracking and RPC warning rate-limit
+#         self.leader_address = None
+#         self._last_rpc_warning = {}
+        
 #         logger.info(f"Initialized node {self.id} on {self.address}")
 
 #     def start(self):
@@ -124,7 +128,7 @@
 #                 response = self._send_rpc(node, 'append_entries', request)
 #                 if response and 'term' in response and response['term'] > self.current_term:
 #                     with self.lock:
-#                         self._update_term(response['term'])
+#                         self._update_term(response['term'], reason="existing leader check", source_node=node)
 #                         self.last_heartbeat = time.time()  # Reset election timer
 #                         self.checked_for_leader = True
 #                         logger.info(f"Node {self.id} found an existing leader (or higher term), resetting timeout")
@@ -172,6 +176,7 @@
 #             self.current_term += 1
 #             self.voted_for = self.id
 #             self.election_timeout = self._get_random_election_timeout()
+#             # Reset last_heartbeat so that any valid response helps postpone re-election
 #             self.last_heartbeat = time.time()
 #             logger.info(f"Node {self.id} starting election for term {self.current_term}")
 #             votes_lock = threading.Lock()
@@ -183,16 +188,18 @@
 #                     response = self._send_request_vote_rpc(node)
 #                     if response.get('term', 0) > self.current_term:
 #                         with self.lock:
-#                             self._update_term(response['term'])
+#                             self._update_term(response['term'], reason="request_vote", source_node=response.get('candidate_id', node))
 #                         return
 #                     if response.get('vote_granted', False):
 #                         with votes_lock:
 #                             votes_received += 1
-#                             if votes_received > (len(self.cluster_nodes) + 1) / 2:
-#                                 with self.lock:
-#                                     if self.state == NodeState.CANDIDATE:
-#                                         logger.info(f"Node {self.id} won election with {votes_received} votes")
-#                                         self._become_leader()
+#                         # Reset the candidate's heartbeat on a successful vote to delay timeout further
+#                         with self.lock:
+#                             self.last_heartbeat = time.time()
+#                         with self.lock:
+#                             if self.state == NodeState.CANDIDATE and votes_received > (len(self.cluster_nodes) + 1) / 2:
+#                                 logger.info(f"Node {self.id} won election with {votes_received} votes")
+#                                 self._become_leader()
 #                 except Exception as e:
 #                     logger.warning(f"Failed to request vote from {node}: {e}")
 
@@ -209,7 +216,7 @@
 #             with self.lock:
 #                 if self.state == NodeState.CANDIDATE and votes_received <= (len(self.cluster_nodes) + 1) / 2:
 #                     logger.info(f"Node {self.id} lost election with {votes_received} votes")
-#                     # Wait for the next election timeout to trigger another election
+#                     # The main loop will trigger another election if needed.
 
 #     def _become_leader(self):
 #         """Transition to leader state."""
@@ -220,7 +227,8 @@
 #             last_log_index = self.log_storage.get_last_log_index()
 #             self.next_index = {node: last_log_index + 1 for node in self.cluster_nodes}
 #             self.match_index = {node: 0 for node in self.cluster_nodes}
-#             logger.info(f"Node {self.id} became leader for term {self.current_term}")
+#             self.leader_address = self.address  # Mark self as leader
+#             logger.info(f"Leader elected: {self.leader_address} for term {self.current_term}")
 #             self.last_heartbeat = time.time()
 #             time.sleep(0.05)
 #             self._send_heartbeats()
@@ -231,7 +239,7 @@
 #             threading.Thread(target=self._send_append_entries, args=(node,)).start()
 
 #     def _send_append_entries(self, node):
-#         """Send AppendEntries RPC to a specific follower."""
+#         """Send AppendEntries RPC to a specific follower and log its actions."""
 #         with self.lock:
 #             next_idx = self.next_index.get(node, 1)
 #             prev_log_index = next_idx - 1
@@ -254,7 +262,7 @@
 #             response = self._send_rpc(node, 'append_entries', request)
 #             with self.lock:
 #                 if response.get('term', 0) > self.current_term:
-#                     self._update_term(response['term'],reason="higher term in RPC response")
+#                     self._update_term(response['term'], reason="higher term in RPC response", source_node=node)
 #                     return
 #                 if response.get('success', False):
 #                     if entries:
@@ -268,7 +276,7 @@
 #             logger.warning(f"Failed to send AppendEntries to {node}: {e}")
 
 #     def _update_commit_index(self):
-#         """Update commit_index based on majority match_index."""
+#         """Update commit_index based on majority match_index and log the committed entry."""
 #         with self.lock:
 #             if self.state != NodeState.LEADER:
 #                 return
@@ -281,20 +289,32 @@
 #                 if entry and entry.term == self.current_term:
 #                     self.commit_index = majority_commit
 #                     logger.info(f"Leader {self.id} updated commit_index to {self.commit_index}")
+#                     self.commit_log_entries()
+
+#     def commit_log_entries(self):
+#         """Commit new log entries and apply them to the state machine."""
+#         with self.lock:
+#             while self.last_applied < self.commit_index:
+#                 self.last_applied += 1
+#                 entry = self.log_storage.get_log_entry(self.last_applied)
+#                 if entry:
+#                     logger.info(f"Committing entry at index {self.last_applied}: {entry.to_dict()}")
+#                     result = self.state_machine.apply(entry.command)
+#                     logger.debug(f"Applied entry {self.last_applied}: {result}")
 
 #     def _apply_committed_entries(self):
-#         """Apply committed log entries to the state machine."""
+#         """Apply committed log entries to the state machine (if not already applied)."""
 #         with self.lock:
 #             while self.last_applied < self.commit_index:
 #                 self.last_applied += 1
 #                 entry = self.log_storage.get_log_entry(self.last_applied)
 #                 if entry:
 #                     result = self.state_machine.apply(entry.command)
-#                     logger.debug(f"Applied entry {self.last_applied}: {entry.command}")
+#                     logger.debug(f"Applied entry {self.last_applied}: {result}")
 
 #     def _handle_rpc(self, client_socket):
 #         """Handle an incoming RPC request."""
-#         logger.debug(f"Received RPC: {client_socket}")    #this is for debug
+#         logger.debug(f"Received RPC connection from {client_socket.getpeername()}")
 #         try:
 #             data = b""
 #             while True:
@@ -317,9 +337,6 @@
 #             client_socket.close()
 
 #     def _handle_request_vote(self, request):
-#         if request['term'] > self.current_term + 10:  # Reject unreasonable term jumps
-#             logger.warning(f"Rejected invalid term jump from {request['candidate_id']}")
-#             return {'term': self.current_term, 'vote_granted': False}
 #         """Process a RequestVote RPC."""
 #         with self.lock:
 #             term = request.get('term', 0)
@@ -329,7 +346,7 @@
 #             if term < self.current_term:
 #                 return {'term': self.current_term, 'vote_granted': False}
 #             if term > self.current_term:
-#                 self._update_term(term)
+#                 self._update_term(term, reason="request_vote", source_node=candidate_id)
 #             vote_granted = False
 #             if (self.voted_for is None or self.voted_for == candidate_id) and self._is_log_up_to_date(last_log_index, last_log_term):
 #                 self.voted_for = candidate_id
@@ -351,12 +368,14 @@
 #             self.last_heartbeat = time.time()
 #             self.checked_for_leader = True
 #             if term > self.current_term or self.state == NodeState.CANDIDATE:
-#                 self._update_term(term)
+#                 self._update_term(term, reason="AppendEntries", source_node=leader_id)
 #                 logger.info(f"Node {self.id} received AppendEntries from leader {leader_id} with term {term}")
 #             if self.state == NodeState.LEADER and term >= self.current_term:
 #                 self.state = NodeState.FOLLOWER
 #                 self.election_timeout = self._get_random_election_timeout() * 1.5
 #                 logger.info(f"Node {self.id} stepping down as leader due to AppendEntries from {leader_id} with term {term}")
+#             if leader_id:
+#                 self.leader_address = leader_id
 #             if prev_log_index > 0:
 #                 prev_entry = self.log_storage.get_log_entry(prev_log_index)
 #                 if not prev_entry or prev_entry.term != prev_log_term:
@@ -372,23 +391,16 @@
 #                 self.commit_index = min(leader_commit, self.log_storage.get_last_log_index())
 #             return {'term': self.current_term, 'success': True}
 
-#     # def _update_term(self, term):
-#     #     """Update current term and revert to follower."""
-#     #     with self.lock:
-#     #         if term > self.current_term:
-#     #             self.current_term = term
-#     #             self.voted_for = None
-#     #             self.state = NodeState.FOLLOWER
-#     #             logger.info(f"Node {self.id} updated term to {term}, becoming follower")
-
-#     def _update_term(self, term, reason="",source_node=None):
-#         logger.info(f"Leader {self.id} stepping down due to term update from {source_node} (new term: {term})")
+#     def _update_term(self, term, reason="", source_node=None):
+#         """Update current term and revert to follower."""
 #         with self.lock:
 #             if term > self.current_term:
-#                 logger.info(f"Leader {self.id} stepping down due to {reason} (new term: {term})")
+#                 logger.info(f"Node {self.id} updating term from {self.current_term} to {term} due to {reason}. Source: {source_node}")
 #                 self.current_term = term
 #                 self.voted_for = None
 #                 self.state = NodeState.FOLLOWER
+#                 # Clear known leader on term update
+#                 self.leader_address = None
 
 #     def _is_log_up_to_date(self, last_log_index, last_log_term):
 #         """Determine if candidate's log is at least as up-to-date as this node's log."""
@@ -423,7 +435,7 @@
 
 #     def _send_rpc(self, node, rpc_type, request):
 #         """Send an RPC to a given node and return the response."""
-#         logger.debug(f"Sending {rpc_type} to {node}: {request}")            #this is by me for debug
+#         logger.debug(f"Sending {rpc_type} to {node}: {request}")
 #         request['type'] = rpc_type
 #         try:
 #             host, port = node.split(':')
@@ -439,24 +451,36 @@
 #                     data += chunk
 #                 return json.loads(data.decode('utf-8'))
 #         except Exception as e:
-#             logger.warning(f"Failed to send RPC to {node}: {e}")
+#             now = time.time()
+#             last = self._last_rpc_warning.get(node, 0)
+#             if now - last > 5:
+#                 logger.warning(f"Failed to send RPC to {node}: {e}")
+#                 self._last_rpc_warning[node] = now
 #             return {}
 
 #     def _get_random_election_timeout(self):
 #         """Return a random election timeout between 1.5 and 3.0 seconds."""
-#         return random.uniform(5.0, 6.0)
+#         return random.uniform(1.5, 3.0)
 
 #     def propose_command(self, command):
 #         """Propose a command to the cluster (only valid if node is leader)."""
 #         with self.lock:
 #             if self.state != NodeState.LEADER:
 #                 return {'success': False, 'error': 'Not leader', 'leader': self._get_leader_address()}
+#             # Append command to leader's log
 #             entry = LogEntry(self.current_term, command)
 #             entry.index = self.log_storage.append_entry(entry)
 #             logger.info(f"Leader {self.id} proposing command: {command}")
+#             logger.info(f"Command appended successfully to leader {self.id}. Current log length: {self.log_storage.get_last_log_index()}")
+#             # Optionally, send AppendEntries RPCs to all followers immediately
+#             for node in self.cluster_nodes:
+#                 logger.info(f"Sending AppendEntries RPC to {node}")
+#                 response = self._send_append_entries(node)
+#                 logger.info(f"AppendEntries response from {node}: {response}")
+#             # Wait for command to be committed
 #             start_time = time.time()
 #             timeout = 5.0  # seconds
-#             while time.time() - start_time < timeout:   
+#             while time.time() - start_time < timeout:
 #                 if self.commit_index >= entry.index:
 #                     return {'success': True, 'index': entry.index}
 #                 time.sleep(0.1)
@@ -466,12 +490,17 @@
 #         """Return the current leader's address if known."""
 #         if self.state == NodeState.LEADER:
 #             return self.address
+#         elif self.leader_address is not None:
+#             return self.leader_address
 #         return None
 
 #     def get_state_machine_state(self):
 #         """Return the current state of the state machine."""
 #         with self.lock:
 #             return self.state_machine.get_state()
+
+
+
 import json
 import logging
 import os
@@ -549,6 +578,10 @@ class RaftNode:
         self.server_socket.bind(('0.0.0.0', port))
         self.running = False
         
+        # Leader tracking and RPC warning rate-limiting
+        self.leader_address = None
+        self._last_rpc_warning = {}
+        
         logger.info(f"Initialized node {self.id} on {self.address}")
 
     def start(self):
@@ -598,7 +631,7 @@ class RaftNode:
                 response = self._send_rpc(node, 'append_entries', request)
                 if response and 'term' in response and response['term'] > self.current_term:
                     with self.lock:
-                        self._update_term(response['term'])
+                        self._update_term(response['term'], reason="existing leader check", source_node=node)
                         self.last_heartbeat = time.time()  # Reset election timer
                         self.checked_for_leader = True
                         logger.info(f"Node {self.id} found an existing leader (or higher term), resetting timeout")
@@ -646,6 +679,7 @@ class RaftNode:
             self.current_term += 1
             self.voted_for = self.id
             self.election_timeout = self._get_random_election_timeout()
+            # Reset last_heartbeat so that any valid response helps postpone re-election
             self.last_heartbeat = time.time()
             logger.info(f"Node {self.id} starting election for term {self.current_term}")
             votes_lock = threading.Lock()
@@ -657,16 +691,18 @@ class RaftNode:
                     response = self._send_request_vote_rpc(node)
                     if response.get('term', 0) > self.current_term:
                         with self.lock:
-                            self._update_term(response['term'])
+                            self._update_term(response['term'], reason="request_vote", source_node=response.get('candidate_id', node))
                         return
                     if response.get('vote_granted', False):
                         with votes_lock:
                             votes_received += 1
-                            if votes_received > (len(self.cluster_nodes) + 1) / 2:
-                                with self.lock:
-                                    if self.state == NodeState.CANDIDATE:
-                                        logger.info(f"Node {self.id} won election with {votes_received} votes")
-                                        self._become_leader()
+                        # Reset the candidate's heartbeat on a successful vote to delay timeout further
+                        with self.lock:
+                            self.last_heartbeat = time.time()
+                        with self.lock:
+                            if self.state == NodeState.CANDIDATE and votes_received > (len(self.cluster_nodes) + 1) / 2:
+                                logger.info(f"Node {self.id} won election with {votes_received} votes")
+                                self._become_leader()
                 except Exception as e:
                     logger.warning(f"Failed to request vote from {node}: {e}")
 
@@ -683,7 +719,7 @@ class RaftNode:
             with self.lock:
                 if self.state == NodeState.CANDIDATE and votes_received <= (len(self.cluster_nodes) + 1) / 2:
                     logger.info(f"Node {self.id} lost election with {votes_received} votes")
-                    # Wait for the next election timeout to trigger another election
+                    # The main loop will trigger another election if needed.
 
     def _become_leader(self):
         """Transition to leader state."""
@@ -694,7 +730,8 @@ class RaftNode:
             last_log_index = self.log_storage.get_last_log_index()
             self.next_index = {node: last_log_index + 1 for node in self.cluster_nodes}
             self.match_index = {node: 0 for node in self.cluster_nodes}
-            logger.info(f"Node {self.id} became leader for term {self.current_term}")
+            self.leader_address = self.address  # Mark self as leader
+            logger.info(f"Leader elected: {self.leader_address} for term {self.current_term}")
             self.last_heartbeat = time.time()
             time.sleep(0.05)
             self._send_heartbeats()
@@ -724,8 +761,6 @@ class RaftNode:
                 'entries': entries_dict,
                 'leader_commit': self.commit_index
             }
-        # Log what the follower is receiving (if any)
-        # logger.info(f"Node {node} (follower) should receive AppendEntries with {len(entries_dict)} entries")
         try:
             response = self._send_rpc(node, 'append_entries', request)
             with self.lock:
@@ -757,7 +792,6 @@ class RaftNode:
                 if entry and entry.term == self.current_term:
                     self.commit_index = majority_commit
                     logger.info(f"Leader {self.id} updated commit_index to {self.commit_index}")
-                    # Call commit_log_entries to log the commit and apply the command
                     self.commit_log_entries()
 
     def commit_log_entries(self):
@@ -773,7 +807,6 @@ class RaftNode:
 
     def _apply_committed_entries(self):
         """Apply committed log entries to the state machine (if not already applied)."""
-        # This function can be used if you want continuous background application.
         with self.lock:
             while self.last_applied < self.commit_index:
                 self.last_applied += 1
@@ -816,7 +849,7 @@ class RaftNode:
             if term < self.current_term:
                 return {'term': self.current_term, 'vote_granted': False}
             if term > self.current_term:
-                self._update_term(term)
+                self._update_term(term, reason="request_vote", source_node=candidate_id)
             vote_granted = False
             if (self.voted_for is None or self.voted_for == candidate_id) and self._is_log_up_to_date(last_log_index, last_log_term):
                 self.voted_for = candidate_id
@@ -838,12 +871,14 @@ class RaftNode:
             self.last_heartbeat = time.time()
             self.checked_for_leader = True
             if term > self.current_term or self.state == NodeState.CANDIDATE:
-                self._update_term(term)
+                self._update_term(term, reason="AppendEntries", source_node=leader_id)
                 logger.info(f"Node {self.id} received AppendEntries from leader {leader_id} with term {term}")
             if self.state == NodeState.LEADER and term >= self.current_term:
                 self.state = NodeState.FOLLOWER
                 self.election_timeout = self._get_random_election_timeout() * 1.5
                 logger.info(f"Node {self.id} stepping down as leader due to AppendEntries from {leader_id} with term {term}")
+            if leader_id:
+                self.leader_address = leader_id
             if prev_log_index > 0:
                 prev_entry = self.log_storage.get_log_entry(prev_log_index)
                 if not prev_entry or prev_entry.term != prev_log_term:
@@ -867,6 +902,8 @@ class RaftNode:
                 self.current_term = term
                 self.voted_for = None
                 self.state = NodeState.FOLLOWER
+                # Clear known leader on term update.
+                self.leader_address = None
 
     def _is_log_up_to_date(self, last_log_index, last_log_term):
         """Determine if candidate's log is at least as up-to-date as this node's log."""
@@ -917,12 +954,16 @@ class RaftNode:
                     data += chunk
                 return json.loads(data.decode('utf-8'))
         except Exception as e:
-            logger.warning(f"Failed to send RPC to {node}: {e}")
+            now = time.time()
+            last = self._last_rpc_warning.get(node, 0)
+            if now - last > 5:
+                logger.warning(f"Failed to send RPC to {node}: {e}")
+                self._last_rpc_warning[node] = now
             return {}
 
     def _get_random_election_timeout(self):
-        """Return a random election timeout between 5.0 and 6.0 seconds."""
-        return random.uniform(5.0, 6.0)
+        """Return a random election timeout between 1.5 and 3.0 seconds."""
+        return random.uniform(1.5, 3.0)
 
     def propose_command(self, command):
         """Propose a command to the cluster (only valid if node is leader)."""
@@ -952,6 +993,8 @@ class RaftNode:
         """Return the current leader's address if known."""
         if self.state == NodeState.LEADER:
             return self.address
+        elif self.leader_address is not None:
+            return self.leader_address
         return None
 
     def get_state_machine_state(self):

@@ -1,4 +1,4 @@
-# Raft3D
+# 🖨️ Raft3D
 
 Raft3D is a simple distributed system for managing 3D printers, filaments, and print jobs.  
 It uses the Raft consensus algorithm for leader election, log replication, and fault tolerance.

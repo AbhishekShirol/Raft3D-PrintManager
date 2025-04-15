@@ -3,6 +3,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+printer_id_counter = 1
+
 def register_printer_endpoints(app, raft_node):
     """Register printer endpoints with the Flask app."""
     
@@ -10,6 +12,7 @@ def register_printer_endpoints(app, raft_node):
     def create_printer():
         """Create a new printer."""
         try:
+            global printer_id_counter  # reference global counter
             data = request.json
             if not data:
                 return jsonify({'error': 'No data provided'}), 400
@@ -18,11 +21,17 @@ def register_printer_endpoints(app, raft_node):
             if not data.get('company') or not data.get('model'):
                 return jsonify({'error': 'Missing required fields: company, model'}), 400
             
+            printer_id = data.get("id")
+
+            if printer_id is None:
+                printer_id = printer_id_counter
+                printer_id_counter += 1
+            
             # Create command
             command = {
                 'type': 'create_printer',
                 'payload': {
-                    'id': data.get('id'),
+                    'id': str(printer_id),
                     'company': data.get('company'),
                     'model': data.get('model')
                 }

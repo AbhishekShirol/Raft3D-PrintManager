@@ -15,8 +15,7 @@ logs/
 data
 
 # State or persistent data for Raft
-raft_data/
-state/
+data/
 
 # Environment config
 .env

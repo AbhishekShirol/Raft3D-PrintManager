@@ -1,7 +1,12 @@
+import uuid
 from flask import Blueprint, jsonify, request
 import logging
 
+
 logger = logging.getLogger(__name__)
+
+# 👇 Global counter (declared at the module level)
+filament_id_counter = 1
 
 def register_filament_endpoints(app, raft_node):
     """Register filament endpoints with the Flask app."""
@@ -10,9 +15,12 @@ def register_filament_endpoints(app, raft_node):
     def create_filament():
         """Create a new filament."""
         try:
+            global filament_id_counter  # reference global counter
             data = request.json
             if not data:
                 return jsonify({'error': 'No data provided'}), 400
+            
+            filament_id = data.get('id') or str(uuid.uuid4())
             
             # Validate input
             if not data.get('type') or not data.get('color') or not data.get('total_weight_in_grams'):
@@ -25,12 +33,18 @@ def register_filament_endpoints(app, raft_node):
             
             # Set remaining weight to total weight if not provided
             remaining_weight = data.get('remaining_weight_in_grams', data.get('total_weight_in_grams'))
+
+            # Use provided ID or auto-generate a simple one
+            filament_id = data.get('id')
+            if filament_id is None:
+                filament_id = filament_id_counter
+                filament_id_counter += 1
             
             # Create command
             command = {
                 'type': 'create_filament',
                 'payload': {
-                    'id': data.get('id'),
+                    'id': str(filament_id),
                     'type': data.get('type'),
                     'color': data.get('color'),
                     'total_weight_in_grams': data.get('total_weight_in_grams'),

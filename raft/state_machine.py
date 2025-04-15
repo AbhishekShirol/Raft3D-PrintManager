@@ -119,65 +119,52 @@ class RaftStateMachine:
         logger.info(f"Created print job: {print_job}")
         return {'success': True, 'print_job': print_job}
 
-    # def _update_print_job_status(self, payload):
-    #     """Update the status of an existing print job."""
-    #     job_id = payload.get('id')
-    #     new_status = payload.get('status')
-    #     if not job_id or not new_status:
-    #         return {'success': False, 'error': 'Missing required fields for updating status'}
-    #     if job_id not in self.print_jobs:
-    #         return {'success': False, 'error': f"Print job with ID {job_id} not found"}
-    #     job = self.print_jobs[job_id]
-    #     current_status = job['status']
-    #     valid_transitions = {
-    #         'Queued': ['Running', 'Canceled'],
-    #         'Running': ['Done', 'Canceled'],
-    #         'Done': [],
-    #         'Canceled': []
-    #     }
-    #     if new_status not in valid_transitions.get(current_status, []):
-    #         return {'success': False, 'error': f"Invalid status transition from {current_status} to {new_status}"}
-    #     job['status'] = new_status
-    #     # If the job is done, update filament remaining weight.
-    #     if new_status == 'Done':
-    #         filament_id = job['filament_id']
-    #         filament = self.filaments[filament_id]
-    #         filament['remaining_weight_in_grams'] -= job['print_weight_in_grams']
-    #     logger.info(f"Updated print job {job_id} to status {new_status}")
-    #     return {'success': True, 'print_job': job}
 
     def _update_print_job_status(self, payload):
         """Update the status of an existing print job."""
         job_id = payload.get('id')
         new_status = payload.get('status')
+        
         if not job_id or not new_status:
             return {'success': False, 'error': 'Missing required fields for updating status'}
+        
         if job_id not in self.print_jobs:
             return {'success': False, 'error': f"Print job with ID {job_id} not found"}
+        
         job = self.print_jobs[job_id]
         current_status = job['status']
+        
+        # If the job is already in the desired status, no update is needed.
+        if current_status == new_status:
+            logger.info(f"Print job {job_id} already in status {current_status}. No update needed.")
+            return {'success': True, 'print_job': job}
+        
         valid_transitions = {
             'Queued': ['Running', 'Canceled'],
             'Running': ['Done', 'Canceled'],
             'Done': [],
             'Canceled': []
         }
-        # if new_status not in valid_transitions.get(current_status, []):
-        #     logger.error(f"Invalid status transition attempted from {current_status} to {new_status} for job {job_id}")
-        #     return {'success': False, 'error': f"Invalid status transition from {current_status} to {new_status}"}
+        
         if new_status not in valid_transitions.get(current_status, []):
             logger.warning(f"Invalid status transition from {current_status} to {new_status} for job {job_id}")
             return {'success': False, 'error': f"Invalid status transition from {current_status} to {new_status}"}
-
+        
+        # Apply the status change.
         job['status'] = new_status
-        # If the job is done, update filament remaining weight.
+        
+        # If the job is marked as Done, update the filament's remaining weight.
         if new_status == 'Done':
-            filament_id = job['filament_id']
-            filament = self.filaments[filament_id]
-            filament['remaining_weight_in_grams'] -= job['print_weight_in_grams']
+            filament_id = job.get('filament_id')
+            if filament_id and filament_id in self.filaments:
+                filament = self.filaments[filament_id]
+                job_weight = job.get('print_weight_in_grams', 0)
+                filament['remaining_weight_in_grams'] -= job_weight
+            else:
+                logger.warning(f"Filament with ID {filament_id} not found for job {job_id}")
+        
         logger.info(f"Updated print job {job_id} to status {new_status}")
         return {'success': True, 'print_job': job}
-
 
     def get_state(self):
         """Return the current state of the FSM."""
